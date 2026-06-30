@@ -22,6 +22,15 @@ def score(task: str, output: str, reference: str, rubric: str) -> ScoreResult:
     return _score_rubric_keywords(output, rubric)
 
 
+_RUBRIC_PARAPHRASES: dict[str, list[str]] = {
+    "chief complaint": ["chief complaint", "presents with", "presented with", "cc:", "complains of", "complained of"],
+    "current medications": ["current medications", "medications include", "is currently taking", "currently on", "on medications"],
+    "follow-up plan": ["follow-up plan", "follow up", "follow-up", "recheck", "return in", "scheduled in", "scheduled for"],
+    "diagnosis": ["diagnosis", "diagnosed with", "assessment:", "impression:"],
+    "allergies": ["allergies", "allergy", "allergic to", "nkda", "no known"],
+}
+
+
 def _score_rubric_keywords(output: str, rubric: str) -> ScoreResult:
     keywords = _extract_rubric_keywords(rubric)
     if not keywords:
@@ -29,7 +38,17 @@ def _score_rubric_keywords(output: str, rubric: str) -> ScoreResult:
                            detail="No keywords found in rubric.")
 
     output_lower = output.lower()
-    hits = [kw for kw in keywords if kw.lower() in output_lower]
+
+    def _matches(kw: str) -> bool:
+        kw_lower = kw.lower()
+        if kw_lower in output_lower:
+            return True
+        for canonical, paraphrases in _RUBRIC_PARAPHRASES.items():
+            if kw_lower == canonical or kw_lower in paraphrases:
+                return any(p in output_lower for p in paraphrases)
+        return False
+
+    hits = [kw for kw in keywords if _matches(kw)]
     score_val = len(hits) / len(keywords)
 
     detail = (
