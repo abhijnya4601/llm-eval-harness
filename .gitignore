@@ -1,0 +1,30 @@
+# Environment
+.env
+.env.local
+
+# Cache
+cache/*.db
+cache/*.json
+
+# Reports (keep .gitkeep)
+reports/*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
