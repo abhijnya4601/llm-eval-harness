@@ -24,19 +24,34 @@ Ollama latencies ranked descending (cold run):
 
 Classification examples: 175–324 ms (single-word output — fastest tier).
 
-## Root cause 1 — Cold model start (S001, P99)
+## Root cause 1 — First-call TTFT with model already resident (S001, P99)
 
-S001 is the first request processed. Ollama loads `llama3.2:3b` weights into memory on the
-first call. This adds time-to-first-token (TTFT) latency that does not appear in subsequent
-requests. Subsequent summarization examples (S002–S008) cluster between 1,545–2,388 ms,
-consistent with a warm model.
+S001 is the first request in the run. Ollama had already been used earlier in the session, so
+`llama3.2:3b` weights were resident in memory — this run did **not** capture a true model-load
+cold start. Despite that, S001 still shows a 4,315 ms spike. The extra latency is the
+first-call overhead Ollama incurs even with a resident model: context setup, KV-cache
+initialization, and scheduling latency before the first token is generated. Subsequent
+summarization examples (S002–S008) cluster between 1,545–2,388 ms, consistent with a fully
+warmed inference path.
 
 **Evidence:** S001 at 4,315 ms is 75 % slower than the next summarization example (S002 at
 2,006 ms). The pattern does not repeat; no other summarization example exceeds 2,400 ms.
 
-**Mitigation:** The harness warms the model with a single preflight call before timed
-evaluation starts, or the cache hit path completely avoids this cost (0 ms wall-clock on
-re-runs).
+**Important caveat — the true model-load cold start is worse.** When Ollama serves a model
+that has not been requested since the server started, it loads weights from disk into RAM/VRAM
+before generating a single token. On the Apple M2 used for this run, that adds roughly
+3–8 seconds on top of the first-call TTFT shown here. This benchmark does not capture that
+scenario because the model was already resident. In a production deployment running Ollama
+as an on-demand service, the actual P99 would be substantially higher on first access after a
+server restart or idle timeout.
+
+**Defensible finding:** the 4,315 ms P99 spike is a lower bound on first-call latency, not
+an upper bound. It represents the minimum observable overhead when the model is already loaded.
+Any scenario where the model must be loaded from disk will be slower.
+
+**Mitigation:** A preflight warm-up call before the timed eval loop eliminates the first-call
+TTFT penalty for resident models. The cache eliminates it entirely for repeated runs (0 ms
+wall-clock on cached replay).
 
 ## Root cause 2 — Output length (E004, second-highest latency)
 
@@ -65,7 +80,7 @@ cluster 140–380 ms. This mirrors Ollama's cold-start pattern at much smaller a
 
 | Factor              | Impact         | Affected examples         |
 |---------------------|----------------|---------------------------|
-| First-request TTFT  | +2,000 ms      | S001 (P99 driver)         |
+| First-call TTFT (resident model) | +2,000 ms | S001 (P99 driver; true cold load would be higher) |
 | Long JSON output    | +500–1,500 ms  | E004, E006, E003          |
 | Single-word output  | −1,200 ms      | All C001–C010             |
 | Network RTT (Groq)  | +150 ms floor  | All Groq examples         |
