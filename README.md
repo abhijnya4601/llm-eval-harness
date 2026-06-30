@@ -1,143 +1,217 @@
 # LLM Eval Harness
 
-A local-first evaluation harness for comparing LLM providers on synthetic clinical NLP tasks.
-Runs the same eval set against **Ollama** (local quantized inference) and **Groq** (free-tier cloud API),
-then reports latency, cost, and quality side-by-side: illustrating a real cost/latency/quality tradeoff
-with actual numbers rather than hand-waving.
-
-> **All clinical text in this repo is synthetic and fictional. No real patient data (PHI) is used anywhere.**
+> **All clinical text in this repo is synthetic and fictional. No real patient data or PHI is used anywhere.**
 
 ---
 
-## Architecture
+## What this is
+
+This is a benchmarking harness that runs the same set of NLP tasks against two different LLM providers and produces a side-by-side comparison of quality, latency, and cost. It is designed to be run entirely for free:
+
+- **Ollama** runs a quantized model locally on your machine. No internet required, no cost, no rate limits. Slower because it runs on CPU/GPU locally.
+- **Groq** is a cloud inference API with a free tier. Much faster than local inference because their hardware is purpose-built for it, but subject to rate limits on the free plan.
+
+The eval set covers synthetic clinical NLP tasks — summarizing clinical notes, extracting structured fields from unstructured text, and classifying clinical statements by urgency. This domain is chosen because the tasks have clearly defined right answers that are easy to score automatically without needing a human or a judge model.
+
+The point of the project is to demonstrate how a rigorous eval harness works: consistent interfaces across providers, caching so you don't waste quota re-running the same prompts, retry logic for transient failures, and deterministic scoring that produces real numbers you can defend.
+
+---
+
+## How it works end to end
 
 ```
-scripts/run_eval.py   (CLI)
+scripts/run_eval.py        ← you run this
         │
         ▼
-harness/runner.py     ── load eval set (JSONL)
-        │                  for each example × provider:
-        ├──► harness/cache.py ──► cache hit? return cached GenerationResult
-        │                         cache miss? ──► provider.generate()
+harness/runner.py          ← loads the eval set, loops over examples × providers
         │
-        ├──► harness/providers/
-        │         ├── ollama_provider.py  (POST /api/generate, cost $0)
-        │         └── groq_provider.py   (POST /openai/v1/chat/completions)
-        │                  └── harness/retry.py  (exp. backoff on 429/5xx)
+        ├── harness/cache.py      ← checks SQLite before calling a provider
+        │                            on a hit: returns stored result instantly
+        │                            on a miss: calls the provider, stores result
         │
-        └──► harness/scorer.py  ── rubric_keyword | rubric_json | classification
-                  │
-                  ▼
-        harness/runner.py  ── aggregate stats per provider
-                  │
-                  ▼
-        reports/results_<timestamp>.json  +  stdout table
+        ├── harness/providers/
+        │       ├── ollama_provider.py   ← POST http://localhost:11434/api/generate
+        │       └── groq_provider.py    ← POST https://api.groq.com/openai/v1/chat/completions
+        │               └── harness/retry.py  ← wraps Groq calls with exponential backoff
+        │
+        └── harness/scorer.py     ← scores each output against its reference
+                │
+                ▼
+        harness/runner.py  ← aggregates per-provider stats
+                │
+                ▼
+        stdout table  +  reports/results_<timestamp>.json
 ```
 
-**Key design decision:** both providers return an identical `GenerationResult` dataclass.
-The runner and scorer never inspect which provider was used - they work purely on the
-common interface. Adding a third provider (OpenAI, Anthropic, etc.) requires only a new
-file in `harness/providers/` with no changes to runner or scorer.
+Both providers implement the same `BaseProvider` interface and return the same `GenerationResult` dataclass. The runner and scorer never check which provider is being used — they just call `.generate()` and get back the same shape. This means adding a new provider (OpenAI, a local GGUF model, etc.) only requires a new file in `harness/providers/` with no changes anywhere else.
 
 ---
 
-## Why caching and retry matter for eval harnesses
+## What each file does
 
-**Caching** (`harness/cache.py`): Eval runs are expensive in time and API quota.
-SQLite-backed caching keyed on `sha256(provider:model:prompt:params)` means:
-- Re-running after a partial failure replays from cache instantly.
-- Latency statistics exclude cache hits, so reported numbers are honest.
-- Iterating on the scorer doesn't re-hit the provider.
+### `harness/providers/base.py`
+Defines the interface every provider must implement. Contains `GenerationResult` (a dataclass with `text`, `model`, `provider`, `latency_ms`, `input_tokens`, `output_tokens`, `cost_usd`) and `BaseProvider` (an abstract base class with a single required method: `generate()`).
 
-**Retry with exponential backoff** (`harness/retry.py`): Groq's free tier enforces
-rate limits. A single 429 shouldn't abort a 25-example run — the harness retries up
-to 3× with 1s/2s/4s delays. Non-transient errors (bad auth, malformed request) still
-propagate immediately so failures are debuggable, not silently swallowed.
+### `harness/providers/ollama_provider.py`
+Calls the local Ollama server at `http://localhost:11434/api/generate`. Reads token counts from Ollama's response fields (`eval_count`, `prompt_eval_count`). Cost is always `$0.00`.
+
+### `harness/providers/groq_provider.py`
+Calls the Groq chat completions API. Reads your API key from the `GROQ_API_KEY` environment variable and raises a clear error if it's missing. Computes a projected cost from token counts using Groq's published per-token rates — the free tier charges nothing, but the field shows what the same run would cost at commercial scale.
+
+### `harness/retry.py`
+A decorator that wraps any function with exponential backoff retry. Retries on rate limit errors (429) and transient network failures. Passes through 4xx client errors immediately since those aren't transient. When Groq returns a 429, its response body includes a suggested wait time ("Please try again in 5.33s") — the retry reads that and waits the right amount instead of guessing.
+
+### `harness/cache.py`
+**Uses SQLite** via Python's built-in `sqlite3` module. Stores cached results in `cache/cache.db`. The cache key is a SHA-256 hash of `provider:model:prompt:max_tokens:temperature` — so the same prompt to the same model with the same settings always resolves to the same key. On a cache hit, the stored `GenerationResult` (including original latency) is returned directly. The runner excludes cache hits from latency statistics so the reported numbers reflect actual inference time, not replay time.
+
+### `harness/runner.py`
+Loads the eval set from JSONL, builds a prompt for each example based on task type, checks the cache, calls the provider if needed, scores the output, and aggregates results per provider. Writes a full JSON report to `reports/` after each run.
+
+### `harness/scorer.py`
+Three scoring modes:
+- **Keyword rubric** (summarization): checks what fraction of required phrases from the rubric appear in the model output. Scores 0.0–1.0 with equal weight per phrase.
+- **JSON field matching** (extraction): parses the model's output as JSON (handles raw JSON, markdown code fences, and embedded JSON in prose), then compares each expected field against the reference using case-insensitive substring matching. Partial credit per field.
+- **Label classification**: checks if the expected label (urgent / routine / informational) appears in the output. Falls back to checking known paraphrases for 0.8 partial credit.
+
+### `evals/clinical_eval_set.jsonl`
+25 examples in JSONL format. Each line has: `id`, `task`, `input` (the synthetic clinical text), `reference` (the correct answer), and `rubric` (scoring instructions). Covers 8 summarization examples, 7 extraction examples, and 10 classification examples. All patient names and data are invented.
+
+### `scripts/run_eval.py`
+The CLI entry point. Parses arguments, loads providers, runs the eval, and prints the results table.
+
+---
+
+## Prerequisites
+
+You need Python 3.11+. Check with:
+
+```bash
+python3 --version
+```
 
 ---
 
 ## Setup
 
-### 1. Ollama (local inference)
+### Step 1 — Clone and create a Python environment
 
 ```bash
-# Install: https://ollama.com/download
+git clone <your-repo-url>
+cd llm-eval-harness
+
+python3 -m venv .venv
+source .venv/bin/activate        # on Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+### Step 2 — Install and start Ollama
+
+Ollama runs the local model. Download it from [ollama.com/download](https://ollama.com/download) or via Homebrew:
+
+```bash
 brew install ollama
-ollama serve            # runs on http://localhost:11434
+```
+
+Start the server (keep this running in a separate terminal):
+
+```bash
+ollama serve
+```
+
+Pull the model (about 2 GB, one-time download):
+
+```bash
 ollama pull llama3.2:3b
 ```
 
-### 2. Groq (free-tier cloud)
+### Step 3 — Set up Groq (optional, for the comparison)
 
-Sign up at [console.groq.com](https://console.groq.com) → API Keys → create key.
+Skip this step if you only want to run Ollama.
+
+1. Sign up at [console.groq.com](https://console.groq.com)
+2. Go to **API Keys** and create a key — it starts with `gsk_`
+3. Copy the example env file and add your key:
 
 ```bash
 cp .env.example .env
-# Edit .env and set GROQ_API_KEY=gsk_...
 ```
 
-### 3. Python environment
+Open `.env` and set:
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
 ```
+GROQ_API_KEY=gsk_your_actual_key_here
+```
+
+Do not commit `.env` — it is in `.gitignore`.
 
 ---
 
 ## Running the eval
 
+Make sure your `.venv` is activated (`source .venv/bin/activate`) and Ollama is running (`ollama serve` in another terminal).
+
 ```bash
-# Both providers, all 25 examples
+# Ollama only — all 25 examples
+python scripts/run_eval.py --providers ollama
+
+# Groq only
+python scripts/run_eval.py --providers groq
+
+# Both providers side by side
 python scripts/run_eval.py --providers ollama,groq
 
-# Ollama only, first 5 examples (fast iteration)
+# First 5 examples only — useful for quickly testing that everything works
 python scripts/run_eval.py --providers ollama --limit 5
 
-# Groq only, bypass cache
-python scripts/run_eval.py --providers groq --no-cache
+# Force fresh calls, ignore anything in the cache
+python scripts/run_eval.py --providers ollama --no-cache
 ```
 
----
-
-## Sample results
-
-Results from a run on Apple M-series (llama3.2:3b local vs. llama-3.1-8b-instant on Groq):
-
-```
-| Provider | Model                  |  N | Score | Avg ms | P50 ms | P99 ms |    Cost USD | Cache% |
-|----------|------------------------|---:|------:|-------:|-------:|-------:|------------:|-------:|
-| ollama   | llama3.2:3b            | 25 | 0.742 |   4823 |   4612 |   9103 | $0.000000   |     0% |
-| groq     | llama-3.1-8b-instant   | 25 | 0.821 |    687 |    641 |   1204 | $0.000047   |     0% |
-
-── Task: classification ──
-  ollama       mean score: 0.900  (n=10)
-  groq         mean score: 0.940  (n=10)
-
-── Task: extraction ──
-  ollama       mean score: 0.571  (n=7)
-  groq         mean score: 0.714  (n=7)
-
-── Task: summarization ──
-  ollama       mean score: 0.708  (n=8)
-  groq         mean score: 0.833  (n=8)
-```
-
-**Takeaway:** Groq's 8B model scores ~8 points higher overall and runs 7× faster. The
-cost column shows what these calls would cost at Groq's metered rates — effectively $0
-at this scale but projects to ~$47/M tokens input if run commercially.
+After the run, a JSON report is saved to `reports/results_<timestamp>.json` with the full per-example breakdown.
 
 ---
 
 ## Running tests
 
+No providers need to be running. All HTTP calls are mocked.
+
 ```bash
-pytest                  # 36 tests, no network calls
-pytest --cov=harness    # with coverage
+pytest
+pytest --cov=harness    # with line coverage
 ```
 
-Tests mock all HTTP calls — no real providers needed.
+36 tests cover the cache (roundtrip, key collisions, cache miss), providers (request shape, response parsing, 429 handling, missing API key), and scorer (keyword rubric, JSON extraction, classification, JSON parser edge cases).
+
+---
+
+## Sample results
+
+Run on Apple M2, `llama3.2:3b` local vs. `llama-3.1-8b-instant` on Groq:
+
+```
+| Provider | Model                |  N | Score | Avg ms | P50 ms | P99 ms |   Cost USD | Cache% |
+|----------|----------------------|---:|------:|-------:|-------:|-------:|-----------:|-------:|
+| groq     | llama-3.1-8b-instant | 25 | 0.557 |    252 |    254 |    606 | $0.000301  |     0% |
+| ollama   | llama3.2:3b          | 25 | 0.517 |   2301 |   1820 |  21159 | $0.000000  |     0% |
+
+── Task: classification ──
+  groq         mean score: 0.700  (n=10)
+  ollama       mean score: 0.700  (n=10)
+
+── Task: extraction ──
+  groq         mean score: 0.607  (n=7)
+  ollama       mean score: 0.607  (n=7)
+
+── Task: summarization ──
+  groq         mean score: 0.333  (n=8)
+  ollama       mean score: 0.208  (n=8)
+```
+
+**What the numbers say:**
+- Groq is ~9× faster (252ms vs 2,301ms average) at a projected cost of $0.000301 for 25 examples — effectively free at this scale
+- Classification scores are identical across both providers — single-word answers are easy for models of both sizes
+- The scoring gap shows up in summarization, where the 8B model more reliably includes the rubric phrases the scorer looks for
+- The 21-second P99 for Ollama is the cold-start penalty when the model isn't yet loaded into memory; steady-state is ~1.8s
 
 ---
 
@@ -145,57 +219,47 @@ Tests mock all HTTP calls — no real providers needed.
 
 ```
 harness/
-  providers/base.py          — GenerationResult dataclass + BaseProvider ABC
-  providers/ollama_provider.py
-  providers/groq_provider.py
-  cache.py                   — SQLite disk cache
-  retry.py                   — exponential backoff decorator
-  runner.py                  — orchestration + aggregation + report writing
-  scorer.py                  — rubric_keyword, rubric_json, classification scorers
+  providers/
+    base.py              GenerationResult dataclass + BaseProvider abstract class
+    ollama_provider.py   Local Ollama inference via HTTP
+    groq_provider.py     Groq cloud API, with rate-limit aware retry
+  cache.py               SQLite-backed result cache (cache/cache.db)
+  retry.py               Exponential backoff decorator
+  runner.py              Eval loop, aggregation, report writer
+  scorer.py              Keyword, JSON field, and classification scorers
 evals/
-  clinical_eval_set.jsonl    — 25 synthetic examples (summarization/extraction/classification)
+  clinical_eval_set.jsonl  25 synthetic clinical NLP examples
 scripts/
-  run_eval.py                — CLI entrypoint
+  run_eval.py            CLI entry point
 tests/
   test_cache.py
   test_providers.py
   test_scorer.py
-reports/                     — generated JSON reports (gitignored)
+reports/                 Generated JSON reports — gitignored, reports/.gitkeep committed
+cache/                   SQLite database — gitignored
 ```
 
 ---
 
 ## Known limitations
 
-- **Rubric scorer bias:** keyword presence is a weak proxy for quality. A model that
-  copies the rubric keywords verbatim scores 1.0 even if the output is nonsense.
-  Statistical NLG metrics (ROUGE, BERTScore) would improve this but add heavy ML deps.
+- **Keyword scorer is a weak proxy.** A model that parrots back the rubric keywords verbatim gets a perfect score even if the output is otherwise bad. Real NLG evaluation uses metrics like ROUGE or BERTScore, but those add heavy ML dependencies.
 
-- **LLM-as-judge not implemented:** using the same model to judge itself introduces
-  self-serving bias. A proper judge setup would use a larger/different model (e.g.
-  Groq 70B judging Ollama 3B output) and report inter-rater agreement across runs.
+- **Small eval set.** 25 examples is enough to see directional differences but not enough for statistical significance. A production harness would need hundreds of examples and confidence intervals on score differences.
 
-- **Small eval set (25 examples):** effect sizes at this scale aren't statistically
-  significant. A production harness would need hundreds of examples and bootstrap
-  confidence intervals on score differences.
+- **Groq free tier has a 6,000 TPM limit.** The retry logic handles it, but large runs will spend time waiting. The retry reads Groq's suggested wait time from the response body and sleeps that long rather than guessing.
 
-- **Groq rate limits:** the free tier allows ~30 RPM. Large eval sets should add
-  `--limit` during development or implement a token-bucket throttle in the runner.
-
-- **Single-turn only:** clinical NLP often requires multi-turn or chain-of-thought
-  prompting. This harness sends one-shot prompts; adding a `messages` abstraction to
-  the provider interface would unlock CoT evaluation.
+- **Single-turn prompts only.** Each example is one prompt, one response. Clinical NLP often benefits from multi-turn or chain-of-thought prompting, which would require extending the provider interface to accept a `messages` list.
 
 ---
 
-## What I'd do with more time / at scale
+## What I'd add with more time
 
-| Area | Upgrade |
+| Area | What and why |
 |---|---|
-| Cache backend | Swap SQLite for Redis to support distributed parallel runners |
-| Providers | Add Anthropic Claude, OpenAI, local GGUF models via llama.cpp |
-| Scoring | Add ROUGE-L, BERTScore, and LLM-as-judge with a separate judge model |
-| Statistics | Bootstrap CIs on score differences; McNemar test for classification |
-| Observability | Emit OpenTelemetry spans per provider call; Grafana dashboard |
-| Eval set | Expand to 200+ examples; add multi-turn and instruction-following tasks |
-| CI | GitHub Actions: run tests on push, nightly eval against Ollama in a container |
+| Cache backend | Swap SQLite for Redis to support concurrent parallel runners without write contention |
+| More providers | OpenAI, local GGUF models via llama.cpp, Anthropic — same provider interface, new file each |
+| Better scoring | ROUGE-L for summarization, BERTScore for semantic similarity, LLM-as-judge with a separate model |
+| Statistics | Bootstrap confidence intervals on score differences; McNemar test for classification |
+| Observability | OpenTelemetry spans per provider call so you can see latency breakdown in a trace |
+| CI | GitHub Actions: run the test suite on every push, nightly eval run against Ollama in a container |

@@ -8,30 +8,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ScoreResult:
-    score: float          # 0.0 – 1.0
-    max_score: float      # always 1.0 for rubric mode
-    method: str           # "rubric_keyword" | "rubric_json" | "llm_judge"
-    detail: str           # human-readable breakdown
+    score: float
+    max_score: float
+    method: str
+    detail: str
 
 
 def score(task: str, output: str, reference: str, rubric: str) -> ScoreResult:
-    """Dispatch to the appropriate scorer based on task type."""
     if task == "classification":
         return _score_classification(output, reference, rubric)
     if task == "extraction":
         return _score_extraction(output, reference, rubric)
-    # Default: summarization or anything else → keyword rubric
     return _score_rubric_keywords(output, rubric)
 
 
-# ── Summarization: keyword / phrase presence ──────────────────────────────────
-
 def _score_rubric_keywords(output: str, rubric: str) -> ScoreResult:
-    """Score by checking how many rubric keywords/phrases appear in the output.
-
-    The rubric field should list required elements after "must mention:" or
-    as a comma-separated list. Each present element adds equal weight.
-    """
     keywords = _extract_rubric_keywords(rubric)
     if not keywords:
         return ScoreResult(score=0.0, max_score=1.0, method="rubric_keyword",
@@ -50,30 +41,21 @@ def _score_rubric_keywords(output: str, rubric: str) -> ScoreResult:
 
 
 def _extract_rubric_keywords(rubric: str) -> list[str]:
-    """Pull keywords from rubric strings like 'must mention: X, Y, and Z'."""
     lower = rubric.lower()
     for marker in ("must mention:", "must include:", "should contain:", "required fields:"):
         idx = lower.find(marker)
         if idx != -1:
             rest = rubric[idx + len(marker):]
-            # Strip trailing periods / parens, split on commas and "and"
             rest = re.sub(r"[.()\[\]]", "", rest)
             parts = re.split(r",|\band\b", rest, flags=re.IGNORECASE)
             return [p.strip().strip('"').strip("'") for p in parts if p.strip()]
 
-    # Fallback: treat the whole rubric as a comma list
+    # fallback: treat whole rubric as a comma list
     parts = re.split(r",|\band\b", rubric, flags=re.IGNORECASE)
     return [p.strip() for p in parts if len(p.strip()) > 2]
 
 
-# ── Extraction: JSON field presence + value match ─────────────────────────────
-
 def _score_extraction(output: str, reference: str, rubric: str) -> ScoreResult:
-    """Score JSON extraction by comparing fields to a reference JSON object.
-
-    Partial credit: each correct field is worth 1/N of the total score.
-    Values are compared case-insensitively as strings (flexible for dates, etc.).
-    """
     pred = _parse_json_from_text(output)
     ref = _parse_json_from_text(reference)
 
@@ -106,14 +88,11 @@ def _score_extraction(output: str, reference: str, rubric: str) -> ScoreResult:
 
 
 def _parse_json_from_text(text: str) -> dict | None:
-    """Extract and parse a JSON object from text, tolerating markdown code fences."""
-    # Try direct parse first
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Try extracting from ```json ... ``` block
     match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if match:
         try:
@@ -121,7 +100,6 @@ def _parse_json_from_text(text: str) -> dict | None:
         except json.JSONDecodeError:
             pass
 
-    # Try finding a bare { ... } block
     match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
     if match:
         try:
@@ -132,10 +110,7 @@ def _parse_json_from_text(text: str) -> dict | None:
     return None
 
 
-# ── Classification: exact or near-exact label match ──────────────────────────
-
 def _score_classification(output: str, reference: str, rubric: str) -> ScoreResult:
-    """Score classification by checking if the expected label appears in output."""
     expected = reference.strip().lower()
     output_lower = output.lower()
 
@@ -143,7 +118,6 @@ def _score_classification(output: str, reference: str, rubric: str) -> ScoreResu
         return ScoreResult(score=1.0, max_score=1.0, method="rubric_keyword",
                            detail=f"Label '{expected}' found in output.")
 
-    # Check for common paraphrases (e.g. "urgent" ↔ "high priority")
     paraphrases = {
         "urgent": ["urgent", "high priority", "immediately", "emergent"],
         "routine": ["routine", "non-urgent", "standard", "regular"],

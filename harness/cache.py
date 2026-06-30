@@ -13,11 +13,6 @@ _DEFAULT_DB = Path(__file__).parent.parent / "cache" / "cache.db"
 
 
 class DiskCache:
-    """SQLite-backed cache keyed on sha256(provider:model:prompt:max_tokens:temperature).
-
-    Cache hits are excluded from latency statistics in the runner — this class
-    records the original latency at write time so replayed results are faithful.
-    """
 
     def __init__(self, db_path: Path = _DEFAULT_DB):
         db_path.parent.mkdir(parents=True, exist_ok=True)

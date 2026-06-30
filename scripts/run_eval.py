@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""CLI entrypoint for the LLM eval harness.
-
-Usage:
-    python scripts/run_eval.py --eval-set evals/clinical_eval_set.jsonl --providers ollama,groq
-    python scripts/run_eval.py --providers ollama --limit 5
-    python scripts/run_eval.py --providers groq --no-cache
-"""
 import argparse
 import logging
 import sys
@@ -133,7 +126,6 @@ def main():
     print(render_table(summaries))
     print()
 
-    # Per-task breakdown
     tasks = sorted({r.task for r in records})
     for task in tasks:
         print(f"\n── Task: {task} ──")

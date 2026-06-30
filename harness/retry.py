@@ -5,8 +5,6 @@ from typing import Callable, TypeVar, Any
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -16,13 +14,7 @@ def with_retry(
     base_delay: float = 1.0,
     backoff_factor: float = 2.0,
 ) -> F:
-    """Return a wrapped version of fn with exponential backoff retry.
-
-    Retries on RateLimitError, requests.Timeout, and requests.ConnectionError.
-    Non-retryable HTTP errors (4xx except 429) propagate immediately.
-    """
-    import requests
-    # Import here to avoid circular; retry.py is imported by providers.
+    import requests  # avoid circular import; retry.py is imported by providers
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -38,14 +30,14 @@ def with_retry(
                 last_exc = exc
                 if attempt == max_attempts:
                     break
+                actual_delay = getattr(exc, "retry_after", None) or delay
                 logger.warning(
                     "Attempt %d/%d failed (%s). Retrying in %.1fs.",
-                    attempt, max_attempts, exc, delay,
+                    attempt, max_attempts, exc, actual_delay,
                 )
-                time.sleep(delay)
+                time.sleep(actual_delay)
                 delay *= backoff_factor
-            except requests.HTTPError as exc:
-                # 4xx client errors other than 429 are not transient — don't retry.
+            except requests.HTTPError:
                 raise
 
         raise last_exc  # type: ignore[misc]
