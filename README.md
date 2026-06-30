@@ -222,7 +222,7 @@ MISS, 47.9s wall-clock) followed by a cached replay (all cache HIT, 0.0s wall-cl
 - Groq is ~6.5× faster (254ms vs 1,656ms average) at a projected cost of $0.000301 for 25 examples — effectively free at this scale
 - Extraction and summarization scores are nearly identical across both providers — both model sizes handle structured JSON output and clinical prose similarly well
 - Groq edges ahead in summarization (0.917 vs 0.875) because the 8B model more consistently covers all three required elements
-- The one consistent gap is classification of `informational` examples (C003, C006, C008): both models output `Routine` for every informational label, scoring 0/3 on that sub-category — see [evals/CLASSIFICATION_FINDINGS.md](evals/CLASSIFICATION_FINDINGS.md)
+- The one consistent gap is classification of `informational` examples (C003, C006, C008): both models output `Routine` for all three, scoring 0/3 on that sub-category. This is a confirmed model capability gap — both Llama variants conflate status-update notifications with actionable routine items. It is not fixable by adjusting the scorer; the scorer is correctly penalizing a real failure. See [evals/CLASSIFICATION_FINDINGS.md](evals/CLASSIFICATION_FINDINGS.md)
 - Cache speedup: cached replay of the same 50 (provider × example) pairs took 0.0s wall-clock vs 47.9s cold — a complete elimination of inference cost on repeated runs
 - Groq P99 (402ms) is 1.6× its P50 — a tight distribution. Ollama P99 (4,315ms) is the cold model-load penalty on S001; steady-state is 1,545–2,388ms for summarization
 
