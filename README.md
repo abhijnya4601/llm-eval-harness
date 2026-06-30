@@ -2,7 +2,7 @@
 
 A local-first evaluation harness for comparing LLM providers on synthetic clinical NLP tasks.
 Runs the same eval set against **Ollama** (local quantized inference) and **Groq** (free-tier cloud API),
-then reports latency, cost, and quality side-by-side — illustrating a real cost/latency/quality tradeoff
+then reports latency, cost, and quality side-by-side: illustrating a real cost/latency/quality tradeoff
 with actual numbers rather than hand-waving.
 
 > **All clinical text in this repo is synthetic and fictional. No real patient data (PHI) is used anywhere.**
@@ -35,7 +35,7 @@ harness/runner.py     ── load eval set (JSONL)
 ```
 
 **Key design decision:** both providers return an identical `GenerationResult` dataclass.
-The runner and scorer never inspect which provider was used — they work purely on the
+The runner and scorer never inspect which provider was used - they work purely on the
 common interface. Adding a third provider (OpenAI, Anthropic, etc.) requires only a new
 file in `harness/providers/` with no changes to runner or scorer.
 
