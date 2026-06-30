@@ -77,7 +77,17 @@ Three scoring modes:
 25 examples in JSONL format. Each line has: `id`, `task`, `input` (the synthetic clinical text), `reference` (the correct answer), and `rubric` (scoring instructions). Covers 8 summarization examples, 7 extraction examples, and 10 classification examples. All patient names and data are invented.
 
 ### `scripts/run_eval.py`
-The CLI entry point. Parses arguments, loads providers, runs the eval, and prints the results table.
+The CLI entry point. Parses arguments, loads providers, runs the eval, and prints the results table. Supports `--no-cache` to force fresh provider calls (still writes to cache so follow-up runs get hits) and `--out` to save the report to a specific path.
+
+### `scripts/inspect_task.py`
+Loads a saved report JSON and prints per-example output, score, and scorer detail for a given task. Useful for diagnosing why scores are high or low on specific examples.
+
+```bash
+python scripts/inspect_task.py --task summarization --report reports/results_cold_run.json
+```
+
+### `scripts/plot_results.py`
+Reads a report JSON and generates a 2×3 bar-chart grid comparing providers across overall score, average latency, projected cost, and per-task scores. Saves a PNG to `reports/`.
 
 ---
 
@@ -180,19 +190,20 @@ pytest
 pytest --cov=harness    # with line coverage
 ```
 
-36 tests cover the cache (roundtrip, key collisions, cache miss), providers (request shape, response parsing, 429 handling, missing API key), and scorer (keyword rubric, JSON extraction, classification, JSON parser edge cases).
+41 tests cover the cache (roundtrip, key collisions, cache miss), providers (request shape, response parsing, 429 handling, missing API key), and scorer (keyword rubric, JSON extraction, classification, JSON parser edge cases).
 
 ---
 
 ## Sample results
 
-Run on Apple M2, `llama3.2:3b` local vs. `llama-3.1-8b-instant` on Groq:
+Run on Apple M2, `llama3.2:3b` local vs. `llama-3.1-8b-instant` on Groq. Cold run (all cache
+MISS, 47.9s wall-clock) followed by a cached replay (all cache HIT, 0.0s wall-clock):
 
 ```
 | Provider | Model                |  N | Score | Avg ms | P50 ms | P99 ms |   Cost USD | Cache% |
 |----------|----------------------|---:|------:|-------:|-------:|-------:|-----------:|-------:|
-| groq     | llama-3.1-8b-instant | 25 | 0.557 |    252 |    254 |    606 | $0.000301  |     0% |
-| ollama   | llama3.2:3b          | 25 | 0.517 |   2301 |   1820 |  21159 | $0.000000  |     0% |
+| groq     | llama-3.1-8b-instant | 25 | 0.743 |    254 |    268 |    402 | $0.000301  |     0% |
+| ollama   | llama3.2:3b          | 25 | 0.730 |   1656 |   1756 |   4315 | $0.000000  |     0% |
 
 ── Task: classification ──
   groq         mean score: 0.700  (n=10)
@@ -203,15 +214,33 @@ Run on Apple M2, `llama3.2:3b` local vs. `llama-3.1-8b-instant` on Groq:
   ollama       mean score: 0.607  (n=7)
 
 ── Task: summarization ──
-  groq         mean score: 0.333  (n=8)
-  ollama       mean score: 0.208  (n=8)
+  groq         mean score: 0.917  (n=8)
+  ollama       mean score: 0.875  (n=8)
 ```
 
 **What the numbers say:**
-- Groq is ~9× faster (252ms vs 2,301ms average) at a projected cost of $0.000301 for 25 examples — effectively free at this scale
-- Classification scores are identical across both providers — single-word answers are easy for models of both sizes
-- The scoring gap shows up in summarization, where the 8B model more reliably includes the rubric phrases the scorer looks for
-- The 21-second P99 for Ollama is the cold-start penalty when the model isn't yet loaded into memory; steady-state is ~1.8s
+- Groq is ~6.5× faster (254ms vs 1,656ms average) at a projected cost of $0.000301 for 25 examples — effectively free at this scale
+- Classification and extraction scores are identical across both providers for these tasks — both model sizes handle structured responses well
+- Groq edges ahead in summarization (0.917 vs 0.875) because the 8B model more consistently includes all three required elements in every summary
+- Cache speedup: the cached replay of the same 50 (provider × example) pairs took 0.0s wall-clock vs 47.9s cold — a complete elimination of inference cost on repeated runs
+- Groq P99 (402ms) is 1.6× its P50 — a tight distribution driven by the first network request. Ollama P99 (4,315ms) is the cold model-load penalty on S001; steady-state is 1,545–2,388ms for summarization
+
+## Investigation findings
+
+Two findings documents in `evals/` record the root-cause analysis behind the initial numbers:
+
+**[evals/SUMMARIZATION_FINDINGS.md](evals/SUMMARIZATION_FINDINGS.md)** — Why early summarization
+scores were 0.2–0.3 instead of 0.8+. Root cause: the rubric scorer was checking for abstract
+category labels ("chief complaint", "follow-up plan") while models produce fluent prose that
+describes the content without using those labels. Fix: added a clinical paraphrase map so
+"presents with" satisfies "chief complaint", "follow up in N weeks" satisfies "follow-up plan", etc.
+
+**[evals/LATENCY_FINDINGS.md](evals/LATENCY_FINDINGS.md)** — What drives Ollama's P99 spike
+(4,315ms vs P50 of 1,756ms). Two causes: (1) S001 is the first request — Ollama loads model
+weights into GPU memory on the first call, adding ~2,000ms TTFT that does not repeat; (2)
+extraction examples with 4-medication JSON outputs (E004, E006) are the next-highest latency
+because output length scales inference time. Classification examples (single-word outputs) are
+consistently under 325ms.
 
 ---
 
@@ -228,9 +257,13 @@ harness/
   runner.py              Eval loop, aggregation, report writer
   scorer.py              Keyword, JSON field, and classification scorers
 evals/
-  clinical_eval_set.jsonl  25 synthetic clinical NLP examples
+  clinical_eval_set.jsonl     25 synthetic clinical NLP examples
+  SUMMARIZATION_FINDINGS.md   Root-cause analysis of summarization score calibration
+  LATENCY_FINDINGS.md         Investigation of Ollama P99 latency spike
 scripts/
   run_eval.py            CLI entry point
+  inspect_task.py        Per-example output inspector
+  plot_results.py        matplotlib bar-chart report generator
 tests/
   test_cache.py
   test_providers.py
@@ -243,7 +276,7 @@ cache/                   SQLite database — gitignored
 
 ## Known limitations
 
-- **Keyword scorer is a weak proxy.** A model that parrots back the rubric keywords verbatim gets a perfect score even if the output is otherwise bad. Real NLG evaluation uses metrics like ROUGE or BERTScore, but those add heavy ML dependencies.
+- **Keyword scorer requires rubric calibration.** The scorer matches rubric phrases against model output. If a rubric uses abstract category labels ("chief complaint") while models write fluent prose ("presents with chest tightness"), scores are deflated even when outputs are correct. The harness includes a clinical paraphrase map that handles this for the included eval set, but new rubrics need similar expansion. A model that parrots rubric labels verbatim would get a perfect score; ROUGE or BERTScore would be more robust but add heavy ML dependencies.
 
 - **Small eval set.** 25 examples is enough to see directional differences but not enough for statistical significance. A production harness would need hundreds of examples and confidence intervals on score differences.
 
