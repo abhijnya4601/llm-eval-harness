@@ -6,7 +6,7 @@
 cache/*.db
 cache/*.json
 
-# Reports (keep .gitkeep)
+# Reports (keep .gitkeep, commit charts so they show on GitHub)
 reports/*.json
 
 # Python
