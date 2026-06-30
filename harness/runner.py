@@ -1,7 +1,8 @@
 import json
 import logging
 import statistics
-from dataclasses import dataclass, field, asdict
+import time
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
@@ -75,12 +76,14 @@ def run(
     cache: DiskCache | None = None,
     limit: int | None = None,
     use_cache: bool = True,
+    out_path: Path | None = None,
 ) -> tuple[list[EvalRecord], list[ProviderSummary]]:
     examples = load_eval_set(eval_path)
     if limit:
         examples = examples[:limit]
 
     records: list[EvalRecord] = []
+    wall_t0 = time.perf_counter()
 
     for example in examples:
         prompt = _build_prompt(example)
@@ -112,8 +115,11 @@ def run(
                 score_result.score, result.latency_ms, "HIT" if hit else "MISS",
             )
 
+    wall_seconds = time.perf_counter() - wall_t0
+    logger.info("Total wall-clock time: %.1fs", wall_seconds)
+
     summaries = _aggregate(records)
-    _write_report(records, summaries)
+    _write_report(records, summaries, wall_seconds, out_path)
     return records, summaries
 
 
@@ -148,15 +154,16 @@ def _call_provider(
     cache: DiskCache | None,
     use_cache: bool,
 ) -> tuple[GenerationResult, bool]:
-    if cache and use_cache:
-        key = DiskCache.make_key(provider.provider_name, provider.model_name, prompt, 512, 0.0)
+    key = DiskCache.make_key(provider.provider_name, provider.model_name, prompt, 512, 0.0) if cache else None
+
+    if cache and use_cache and key:
         cached = cache.get(key)
         if cached is not None:
             return cached, True
 
     result = provider.generate(prompt, max_tokens=512, temperature=0.0)
 
-    if cache and use_cache:
+    if cache and key:
         cache.set(key, result)
 
     return result, False
@@ -190,16 +197,22 @@ def _aggregate(records: list[EvalRecord]) -> list[ProviderSummary]:
     return summaries
 
 
-def _write_report(records: list[EvalRecord], summaries: list[ProviderSummary]) -> Path:
+def _write_report(
+    records: list[EvalRecord],
+    summaries: list[ProviderSummary],
+    wall_seconds: float = 0.0,
+    out_path: Path | None = None,
+) -> Path:
     REPORTS_DIR.mkdir(exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    path = REPORTS_DIR / f"results_{ts}.json"
+    path = out_path or (REPORTS_DIR / f"results_{ts}.json")
 
     report = {
         "generated_at": ts,
+        "wall_clock_seconds": round(wall_seconds, 2),
         "summaries": [asdict(s) for s in summaries],
         "records": [asdict(r) for r in records],
     }
     path.write_text(json.dumps(report, indent=2))
-    logger.info("Report written to %s", path)
+    logger.info("Report written to %s  (wall-clock: %.1fs)", path, wall_seconds)
     return path

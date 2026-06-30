@@ -92,7 +92,13 @@ def main():
     parser.add_argument(
         "--no-cache",
         action="store_true",
-        help="Bypass cache — force fresh provider calls",
+        help="Bypass cache reads — force fresh provider calls (still writes to cache)",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Custom output path for the JSON report (default: reports/results_<timestamp>.json)",
     )
     args = parser.parse_args()
 
@@ -106,11 +112,11 @@ def main():
     except (ValueError, EnvironmentError) as e:
         sys.exit(str(e))
 
-    cache = DiskCache() if not args.no_cache else None
+    cache = DiskCache()
 
     print(f"\nRunning eval: {eval_path.name}")
     print(f"Providers:    {', '.join(p.provider_name for p in providers)}")
-    print(f"Cache:        {'disabled' if args.no_cache else 'enabled'}")
+    print(f"Cache reads:  {'disabled (--no-cache)' if args.no_cache else 'enabled'}")
     if args.limit:
         print(f"Limit:        first {args.limit} examples")
     print()
@@ -121,6 +127,7 @@ def main():
         cache=cache,
         limit=args.limit,
         use_cache=not args.no_cache,
+        out_path=args.out,
     )
 
     print("\n" + "=" * 80)
