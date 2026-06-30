@@ -14,6 +14,7 @@ from harness.cache import DiskCache
 from harness.runner import run
 from harness.providers.ollama_provider import OllamaProvider
 from harness.providers.groq_provider import GroqProvider
+from harness.providers.gemini_provider import GeminiProvider
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,8 +31,10 @@ def build_providers(names: list[str]):
             providers.append(OllamaProvider())
         elif name == "groq":
             providers.append(GroqProvider())
+        elif name == "gemini":
+            providers.append(GeminiProvider())
         else:
-            raise ValueError(f"Unknown provider: {name!r}. Choose from: ollama, groq")
+            raise ValueError(f"Unknown provider: {name!r}. Choose from: ollama, groq, gemini")
     return providers
 
 

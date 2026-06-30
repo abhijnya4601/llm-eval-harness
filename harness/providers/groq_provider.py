@@ -3,7 +3,7 @@ import time
 import requests
 
 from .base import BaseProvider, GenerationResult
-from ..retry import with_retry
+from ..retry import with_retry, RateLimitError
 
 # Groq published rates as of 2025; free tier bills $0 but we track cost for at-scale projections
 _INPUT_COST_PER_M = 0.05
@@ -64,8 +64,7 @@ class GroqProvider(BaseProvider):
         response.raise_for_status()
         data = response.json()
 
-        choice = data["choices"][0]
-        text = choice["message"]["content"].strip()
+        text = data["choices"][0]["message"]["content"].strip()
         usage = data.get("usage", {})
         in_tok = usage.get("prompt_tokens")
         out_tok = usage.get("completion_tokens")
@@ -83,17 +82,3 @@ class GroqProvider(BaseProvider):
             output_tokens=out_tok,
             cost_usd=cost,
         )
-
-
-class RateLimitError(Exception):
-    def __init__(self, message: str, body: str = ""):
-        super().__init__(message)
-        self.retry_after: float | None = _parse_retry_after(body)
-
-
-def _parse_retry_after(body: str) -> float | None:
-    import re
-    match = re.search(r"try again in ([\d.]+)s", body)
-    if match:
-        return float(match.group(1)) + 0.5  # pad slightly so the window actually resets
-    return None

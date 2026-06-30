@@ -4,7 +4,9 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from harness.providers.ollama_provider import OllamaProvider
-from harness.providers.groq_provider import GroqProvider, RateLimitError
+from harness.providers.groq_provider import GroqProvider
+from harness.providers.gemini_provider import GeminiProvider
+from harness.retry import RateLimitError
 from harness.providers.base import GenerationResult
 
 
@@ -145,6 +147,81 @@ def test_groq_cost_computed_from_tokens(mock_post):
     mock_post.return_value = _mock_groq_response()
     provider = GroqProvider(api_key="test-key")
     result = provider.generate("Test.")
-    # 100 input tokens * $0.05/M + 5 output tokens * $0.08/M
     expected = (100 / 1_000_000) * 0.05 + (5 / 1_000_000) * 0.08
+    assert abs(result.cost_usd - expected) < 1e-10
+
+
+# ── Gemini ────────────────────────────────────────────────────────────────────
+
+GEMINI_RESPONSE = {
+    "candidates": [
+        {"content": {"parts": [{"text": "  Urgent case.  "}], "role": "model"}}
+    ],
+    "usageMetadata": {"promptTokenCount": 80, "candidatesTokenCount": 4, "totalTokenCount": 84},
+}
+
+
+def _mock_gemini_response(status=200, body=None):
+    mock_resp = MagicMock()
+    mock_resp.status_code = status
+    mock_resp.json.return_value = body or GEMINI_RESPONSE
+    if status == 429:
+        mock_resp.text = "Rate limit exceeded. Please retry in 5s."
+        mock_resp.raise_for_status.side_effect = None
+    else:
+        mock_resp.raise_for_status = MagicMock()
+    return mock_resp
+
+
+@patch("harness.providers.gemini_provider.requests.post")
+def test_gemini_builds_correct_request(mock_post):
+    mock_post.return_value = _mock_gemini_response()
+    provider = GeminiProvider(api_key="test-key")
+    provider.generate("Classify this.", max_tokens=10, temperature=0.0)
+
+    mock_post.assert_called_once()
+    _, kwargs = mock_post.call_args
+    payload = kwargs["json"]
+    assert payload["contents"][0]["role"] == "user"
+    assert payload["contents"][0]["parts"][0]["text"] == "Classify this."
+    assert payload["generationConfig"]["maxOutputTokens"] == 10
+    assert kwargs["params"]["key"] == "test-key"
+
+
+@patch("harness.providers.gemini_provider.requests.post")
+def test_gemini_parses_response(mock_post):
+    mock_post.return_value = _mock_gemini_response()
+    provider = GeminiProvider(api_key="test-key")
+    result = provider.generate("Test prompt.")
+
+    assert isinstance(result, GenerationResult)
+    assert result.text == "Urgent case."
+    assert result.provider == "gemini"
+    assert result.input_tokens == 80   # usageMetadata.promptTokenCount
+    assert result.output_tokens == 4   # usageMetadata.candidatesTokenCount
+    assert result.cost_usd > 0
+
+
+@patch("harness.providers.gemini_provider.requests.post")
+def test_gemini_raises_rate_limit_on_429(mock_post):
+    mock_post.return_value = _mock_gemini_response(status=429)
+    provider = GeminiProvider(api_key="test-key")
+
+    with patch("harness.retry.time.sleep"):
+        with pytest.raises(RateLimitError):
+            provider.generate("Test.")
+
+
+def test_gemini_raises_on_missing_api_key(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    with pytest.raises(EnvironmentError, match="GEMINI_API_KEY"):
+        GeminiProvider()
+
+
+@patch("harness.providers.gemini_provider.requests.post")
+def test_gemini_cost_computed_from_tokens(mock_post):
+    mock_post.return_value = _mock_gemini_response()
+    provider = GeminiProvider(api_key="test-key")
+    result = provider.generate("Test.")
+    expected = (80 / 1_000_000) * 0.075 + (4 / 1_000_000) * 0.30
     assert abs(result.cost_usd - expected) < 1e-10

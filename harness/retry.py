@@ -1,3 +1,4 @@
+import re
 import time
 import functools
 import logging
@@ -6,6 +7,20 @@ from typing import Callable, TypeVar, Any
 logger = logging.getLogger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
+
+
+class RateLimitError(Exception):
+    def __init__(self, message: str, body: str = ""):
+        super().__init__(message)
+        self.retry_after: float | None = _parse_retry_after(body)
+
+
+def _parse_retry_after(body: str) -> float | None:
+    # Matches "try again in 5.3s" (Groq) and "retry in 4s" (Gemini)
+    match = re.search(r"retry in ([\d.]+)s", body, re.IGNORECASE)
+    if match:
+        return float(match.group(1)) + 0.5  # pad slightly so the window actually resets
+    return None
 
 
 def with_retry(
@@ -18,8 +33,6 @@ def with_retry(
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        from harness.providers.groq_provider import RateLimitError
-
         last_exc: Exception | None = None
         delay = base_delay
 
