@@ -74,6 +74,53 @@ def _extract_rubric_keywords(rubric: str) -> list[str]:
     return [p.strip() for p in parts if len(p.strip()) > 2]
 
 
+def _flatten_val(val) -> str:
+    """Recursively flatten any JSON value (list, dict, scalar) to a lowercase string."""
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        return " ".join(_flatten_val(item) for item in val if item is not None)
+    if isinstance(val, dict):
+        return " ".join(_flatten_val(v) for v in val.values() if v is not None)
+    return str(val).lower().strip()
+
+
+_NONE_SYNONYMS = {"none", "none known", "nkda", "no known allergies", "no known drug allergies", "null", "[]", ""}
+
+
+def _is_none_val(s: str) -> bool:
+    return s in _NONE_SYNONYMS or "nkda" in s or ("none" in s and "known" in s)
+
+
+def _extraction_field_matches(ref_val, pred_val) -> bool:
+    """
+    Compare one extracted field against its reference.
+
+    Handles three problems the naïve str() comparison misses:
+    - Models return medication lists with dosage appended; reference has bare names.
+    - Ollama returns {name, dosage} objects; reference has flat strings.
+    - "none" / [] / "NKDA" / null are all equivalent for allergy fields.
+    """
+    pred_flat = _flatten_val(pred_val)
+    ref_flat = _flatten_val(ref_val)
+
+    if _is_none_val(ref_flat):
+        return _is_none_val(pred_flat)
+    if not pred_flat:
+        return False
+
+    # list reference: every item must appear somewhere in the flattened prediction
+    if isinstance(ref_val, list):
+        return all(_flatten_val(item) in pred_flat for item in ref_val if item is not None)
+
+    # comma/semicolon-separated string (e.g. "sulfa drugs, latex"): each part must appear
+    ref_parts = [p.strip() for p in re.split(r"[,;]", ref_flat) if p.strip()]
+    if len(ref_parts) > 1:
+        return all(part in pred_flat for part in ref_parts)
+
+    return ref_flat in pred_flat or pred_flat in ref_flat
+
+
 def _score_extraction(output: str, reference: str, rubric: str) -> ScoreResult:
     pred = _parse_json_from_text(output)
     ref = _parse_json_from_text(reference)
@@ -94,9 +141,7 @@ def _score_extraction(output: str, reference: str, rubric: str) -> ScoreResult:
 
     hits, misses = [], []
     for field in fields:
-        ref_val = str(ref.get(field, "")).lower().strip()
-        pred_val = str(pred.get(field, "")).lower().strip()
-        if pred_val and ref_val and (ref_val in pred_val or pred_val in ref_val):
+        if _extraction_field_matches(ref.get(field), pred.get(field)):
             hits.append(field)
         else:
             misses.append(field)

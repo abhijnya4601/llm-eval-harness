@@ -202,16 +202,16 @@ MISS, 47.9s wall-clock) followed by a cached replay (all cache HIT, 0.0s wall-cl
 ```
 | Provider | Model                |  N | Score | Avg ms | P50 ms | P99 ms |   Cost USD | Cache% |
 |----------|----------------------|---:|------:|-------:|-------:|-------:|-----------:|-------:|
-| groq     | llama-3.1-8b-instant | 25 | 0.743 |    254 |    268 |    402 | $0.000301  |     0% |
-| ollama   | llama3.2:3b          | 25 | 0.730 |   1656 |   1756 |   4315 | $0.000000  |     0% |
+| groq     | llama-3.1-8b-instant | 25 | 0.843 |    254 |    268 |    402 | $0.000301  |     0% |
+| ollama   | llama3.2:3b          | 25 | 0.830 |   1656 |   1756 |   4315 | $0.000000  |     0% |
 
 ── Task: classification ──
   groq         mean score: 0.700  (n=10)
   ollama       mean score: 0.700  (n=10)
 
 ── Task: extraction ──
-  groq         mean score: 0.607  (n=7)
-  ollama       mean score: 0.607  (n=7)
+  groq         mean score: 0.964  (n=7)
+  ollama       mean score: 0.964  (n=7)
 
 ── Task: summarization ──
   groq         mean score: 0.917  (n=8)
@@ -220,10 +220,11 @@ MISS, 47.9s wall-clock) followed by a cached replay (all cache HIT, 0.0s wall-cl
 
 **What the numbers say:**
 - Groq is ~6.5× faster (254ms vs 1,656ms average) at a projected cost of $0.000301 for 25 examples — effectively free at this scale
-- Classification and extraction scores are identical across both providers for these tasks — both model sizes handle structured responses well
-- Groq edges ahead in summarization (0.917 vs 0.875) because the 8B model more consistently includes all three required elements in every summary
-- Cache speedup: the cached replay of the same 50 (provider × example) pairs took 0.0s wall-clock vs 47.9s cold — a complete elimination of inference cost on repeated runs
-- Groq P99 (402ms) is 1.6× its P50 — a tight distribution driven by the first network request. Ollama P99 (4,315ms) is the cold model-load penalty on S001; steady-state is 1,545–2,388ms for summarization
+- Extraction and summarization scores are nearly identical across both providers — both model sizes handle structured JSON output and clinical prose similarly well
+- Groq edges ahead in summarization (0.917 vs 0.875) because the 8B model more consistently covers all three required elements
+- The one consistent gap is classification of `informational` examples (C003, C006, C008): both models output `Routine` for every informational label, scoring 0/3 on that sub-category — see [evals/CLASSIFICATION_FINDINGS.md](evals/CLASSIFICATION_FINDINGS.md)
+- Cache speedup: cached replay of the same 50 (provider × example) pairs took 0.0s wall-clock vs 47.9s cold — a complete elimination of inference cost on repeated runs
+- Groq P99 (402ms) is 1.6× its P50 — a tight distribution. Ollama P99 (4,315ms) is the cold model-load penalty on S001; steady-state is 1,545–2,388ms for summarization
 
 ## Investigation findings
 
@@ -235,12 +236,23 @@ category labels ("chief complaint", "follow-up plan") while models produce fluen
 describes the content without using those labels. Fix: added a clinical paraphrase map so
 "presents with" satisfies "chief complaint", "follow up in N weeks" satisfies "follow-up plan", etc.
 
+**[evals/EXTRACTION_FINDINGS.md](evals/EXTRACTION_FINDINGS.md)** — Why extraction was stuck at
+0.607 despite models returning correct JSON. Root cause: the scorer did `str(list)` comparison,
+so `["amoxicillin-clavulanate 875mg BID"]` never matched reference `["amoxicillin-clavulanate"]`,
+and `[]` never matched `"none"`. Fix: recursive flattening of lists and dicts, per-item
+membership checking for list fields, and normalization of empty/NKDA/null allergy values.
+Scores rose from 0.607 → 0.964 for both providers.
+
+**[evals/CLASSIFICATION_FINDINGS.md](evals/CLASSIFICATION_FINDINGS.md)** — Why classification
+scores are 0.700 and cannot be scored higher through rubric fixes. Both models (3B and 8B
+Llama) consistently classify every `informational` example as `Routine`. This is a confirmed
+model capability gap, not a scorer error — the scorer correctly penalizes it.
+
 **[evals/LATENCY_FINDINGS.md](evals/LATENCY_FINDINGS.md)** — What drives Ollama's P99 spike
-(4,315ms vs P50 of 1,756ms). Two causes: (1) S001 is the first request — Ollama loads model
-weights into GPU memory on the first call, adding ~2,000ms TTFT that does not repeat; (2)
-extraction examples with 4-medication JSON outputs (E004, E006) are the next-highest latency
-because output length scales inference time. Classification examples (single-word outputs) are
-consistently under 325ms.
+(4,315ms vs P50 of 1,756ms). Two causes: (1) S001 is the first request — even with the model
+already resident, first-call TTFT overhead adds ~2,000ms; a true cold start from disk would be
+slower still; (2) extraction examples with 4-medication JSON outputs (E004, E006) are
+next-highest because output length scales inference time.
 
 ---
 
@@ -257,9 +269,11 @@ harness/
   runner.py              Eval loop, aggregation, report writer
   scorer.py              Keyword, JSON field, and classification scorers
 evals/
-  clinical_eval_set.jsonl     25 synthetic clinical NLP examples
-  SUMMARIZATION_FINDINGS.md   Root-cause analysis of summarization score calibration
-  LATENCY_FINDINGS.md         Investigation of Ollama P99 latency spike
+  clinical_eval_set.jsonl       25 synthetic clinical NLP examples
+  SUMMARIZATION_FINDINGS.md     Rubric label mismatch → paraphrase fix (0.21→0.88)
+  EXTRACTION_FINDINGS.md        List field comparison fix (0.607→0.964)
+  CLASSIFICATION_FINDINGS.md    Confirmed model gap on "informational" label
+  LATENCY_FINDINGS.md           Ollama P99 spike — first-call TTFT + output length
 scripts/
   run_eval.py            CLI entry point
   inspect_task.py        Per-example output inspector
